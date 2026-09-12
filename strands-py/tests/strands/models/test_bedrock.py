@@ -356,7 +356,12 @@ def test__init__model_config(bedrock_client):
 
 @pytest.mark.parametrize(
     "guardrail_config",
-    [{"guardrail_id": "g1"}, {"guardrail_version": "v1"}, {"guardrail_id": "", "guardrail_version": "v1"}],
+    [
+        {"guardrail_id": "g1"},
+        {"guardrail_version": "v1"},
+        {"guardrail_id": "", "guardrail_version": "v1"},
+        {"guardrail_id": "g1", "guardrail_version": ""},
+    ],
 )
 def test__init__partial_guardrail_config_raises_value_error(bedrock_client, guardrail_config):
     """Reject partial guardrail configuration (#4204)."""
@@ -424,7 +429,12 @@ def test_update_config(model, model_id):
 
 @pytest.mark.parametrize(
     "guardrail_config",
-    [{"guardrail_id": "g1"}, {"guardrail_version": "v1"}, {"guardrail_id": "", "guardrail_version": "v1"}],
+    [
+        {"guardrail_id": "g1"},
+        {"guardrail_version": "v1"},
+        {"guardrail_id": "", "guardrail_version": "v1"},
+        {"guardrail_id": "g1", "guardrail_version": ""},
+    ],
 )
 def test_update_config_partial_guardrail_config_raises_value_error(model, guardrail_config):
     """Reject updating only one guardrail setting (#4204)."""
