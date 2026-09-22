@@ -25,30 +25,33 @@ from google.genai import types as genai_types
 from google.genai.types import LiveConnectConfigOrDict, LiveServerContent, LiveServerMessage, UsageMetadata
 from typing_extensions import Unpack, override
 
-from ....types._events import ToolResultEvent, ToolUseStreamEvent
-from ....types.content import Messages
-from ....types.tools import ToolResult, ToolSpec, ToolUse
+from ....models._validation import validate_config_keys
+from ....types._events import ToolUseStreamEvent
+from ....types.content import Messages, TextBlock
+from ....types.media import ImageBlock
+from ....types.tools import ToolResultBlock, ToolSpec, ToolUse
 from .._async import stop_all
+from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
-    BidiAudioInputEvent,
     BidiAudioStreamEvent,
     BidiConnectionStartEvent,
-    BidiImageInputEvent,
-    BidiInputEvent,
     BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
-    BidiTextInputEvent,
     BidiTranscriptCompleteEvent,
     BidiTranscriptStreamEvent,
     BidiUsageEvent,
     ModalityUsage,
 )
+from ..types.media import AudioDelta
 from .configs import (
     AudioConfig,
+    AudioStreamConfig,
     BidiConnectionConfig,
     BidiModelConfig,
+    GoogleGeminiLiveAudioConfig,
+    GoogleGeminiLiveAudioStreamConfig,
     _merge_config,
     _validate_audio_config,
     _validate_model_config,
@@ -85,7 +88,8 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         self,
         *,
         client_args: dict[str, Any] | None = None,
-        audio: AudioConfig | None = None,
+        audio: GoogleGeminiLiveAudioConfig | None = None,
+        voice: str | None = None,
         **model_config: Unpack[BidiModelConfig],
     ) -> None:
         """Initialize the Google Gemini Live bidirectional model.
@@ -93,12 +97,16 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         Args:
             client_args: Arguments for the underlying Google GenAI client.
             audio: Audio configuration.
+            voice: Prebuilt output voice name. Omit to use the provider's default.
             **model_config: Model configuration.
+
+        Raises:
+            ValueError: If the input sample rate is not positive.
         """
         _validate_model_config(model_config)
-        _validate_audio_config(audio)
         self._config = BidiModelConfig(**model_config)
         self._config.setdefault("model_id", "gemini-2.5-flash-native-audio-preview-09-2025")
+        self._config["params"] = dict(self._config.get("params") or {})
 
         # Gemini caps a single connection at ~10 min; reconnect before that, resuming the same
         # session via its handle. The GoAway message remains the reactive backstop.
@@ -108,17 +116,8 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         # Gemini reports per-response token deltas, not cumulative session totals.
         self.usage_is_cumulative = False
 
-        self._audio_config = AudioConfig(
-            **{
-                "input_rate": 16000,
-                "output_rate": 24000,
-                "channels": 1,
-                "format": "pcm",
-                **(audio or {}),
-            }
-        )
-
-        self._config["params"] = dict(self._config.get("params") or {})
+        self._resolve_audio_config(audio)
+        self._voice = voice
 
         self.client_args = dict(client_args or {})
         self._client = genai.Client(**self.client_args)
@@ -148,6 +147,23 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
     def get_audio_config(self) -> AudioConfig:
         """Get the resolved audio configuration."""
         return self._audio_config
+
+    def _resolve_audio_config(self, config: GoogleGeminiLiveAudioConfig | None) -> None:
+        """Resolve and validate input and output audio settings."""
+        config = config or {}
+        validate_config_keys(config, GoogleGeminiLiveAudioConfig)
+
+        input_config = config.get("input", {"sample_rate": 16000})
+        validate_config_keys(input_config, GoogleGeminiLiveAudioStreamConfig)
+        sample_rate = input_config["sample_rate"]
+        if sample_rate <= 0:
+            raise ValueError(f"Unsupported sample rate: {sample_rate}. Expected a positive value.")
+
+        self._audio_config = AudioConfig(
+            input=AudioStreamConfig(sample_rate=sample_rate, channels=1, format="pcm"),
+            output=AudioStreamConfig(sample_rate=24000, channels=1, format="pcm"),
+        )
+        _validate_audio_config(self._audio_config)
 
     async def start(
         self,
@@ -292,9 +308,7 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
             events.append(
                 BidiAudioStreamEvent(
                     audio=audio_b64,
-                    format="pcm",
-                    sample_rate=self._audio_config["output_rate"],
-                    channels=self._audio_config["channels"],
+                    **self._audio_config["output"],
                 )
             )
 
@@ -475,58 +489,62 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
 
     async def send(
         self,
-        content: BidiInputEvent | ToolResultEvent,
+        content: BidiContentBlock | BidiContentDelta | ToolResultBlock,
     ) -> None:
         """Unified send method for all content types. Sends the given inputs to the Gemini Live API.
 
         Dispatches to appropriate internal handler based on content type.
 
         Args:
-            content: Typed event (BidiTextInputEvent, BidiAudioInputEvent, BidiImageInputEvent, or ToolResultEvent).
+            content: A TextBlock, AudioDelta, ImageBlock, or ToolResultBlock.
 
         Raises:
-            ValueError: If content type not supported (e.g., image content).
+            ValueError: If content type not supported.
         """
         if not self._connection_id:
             raise RuntimeError("model not started | call start before sending")
 
-        if isinstance(content, BidiTextInputEvent):
+        if isinstance(content, TextBlock):
             await self._send_text_content(content.text)
-        elif isinstance(content, BidiAudioInputEvent):
+        elif isinstance(content, AudioDelta):
             await self._send_audio_content(content)
-        elif isinstance(content, BidiImageInputEvent):
+        elif isinstance(content, ImageBlock):
             await self._send_image_content(content)
-        elif isinstance(content, ToolResultEvent):
-            tool_result = content.get("tool_result")
-            if tool_result:
-                await self._send_tool_result(tool_result)
+        elif isinstance(content, ToolResultBlock):
+            await self._send_tool_result(content)
         else:
             raise ValueError(f"content_type={type(content)} | content not supported")
 
-    async def _send_audio_content(self, audio_input: BidiAudioInputEvent) -> None:
+    async def _send_audio_content(self, audio_input: AudioDelta) -> None:
         """Internal: Send audio content using Gemini Live API.
 
         Gemini Live expects continuous audio streaming via send_realtime_input.
         This automatically triggers VAD and can interrupt ongoing responses.
         """
-        # Decode base64 audio to bytes for SDK
-        audio_bytes = base64.b64decode(audio_input.audio)
+        audio_bytes = audio_input.source.get("bytes")
+        if audio_bytes is None:
+            raise ValueError("audio source must contain bytes for Gemini Live")
 
         # Create audio blob for the SDK
-        mime_type = f"audio/pcm;rate={self._audio_config['input_rate']}"
+        mime_type = f"audio/pcm;rate={self._audio_config['input']['sample_rate']}"
         audio_blob = genai_types.Blob(data=audio_bytes, mime_type=mime_type)
 
         # Send real-time audio input - this automatically handles VAD and interruption
         await self._live_session.send_realtime_input(audio=audio_blob)
 
-    async def _send_image_content(self, image_input: BidiImageInputEvent) -> None:
+    async def _send_image_content(self, image_input: ImageBlock) -> None:
         """Internal: Send image content using Gemini Live API.
 
         Sends image frames following the same pattern as the GitHub example.
         Images are sent as base64-encoded data with MIME type.
         """
-        # Image is already base64 encoded in the event
-        msg = {"mime_type": image_input.mime_type, "data": image_input.image}
+        image_bytes = image_input.source.get("bytes")
+        if image_bytes is None:
+            raise ValueError("image source must contain bytes for Gemini Live")
+        msg = {
+            "mime_type": f"image/{image_input.format}",
+            "data": base64.b64encode(image_bytes).decode("utf-8"),
+        }
 
         # Send using the same method as the GitHub example
         await self._live_session.send(input=msg)
@@ -541,10 +559,10 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         """
         await self._live_session.send_realtime_input(text=text)
 
-    async def _send_tool_result(self, tool_result: ToolResult) -> None:
+    async def _send_tool_result(self, tool_result: ToolResultBlock) -> None:
         """Internal: Send tool result using Gemini Live API."""
-        tool_use_id = tool_result.get("toolUseId")
-        content = tool_result.get("content", [])
+        tool_use_id = tool_result.tool_use_id
+        content = tool_result.content
 
         # Validate all content types are supported
         for block in content:
@@ -696,10 +714,8 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         if tools:
             config_dict["tools"] = self._format_tools_for_live_api(tools)
 
-        if "voice" in self._audio_config:
-            config_dict.setdefault("speech_config", {}).setdefault("voice_config", {}).setdefault(
-                "prebuilt_voice_config", {}
-            )["voice_name"] = self._audio_config["voice"]
+        if self._voice is not None:
+            config_dict["speech_config"] = {"voice_config": {"prebuilt_voice_config": {"voice_name": self._voice}}}
 
         return _merge_config(config_dict, self._config.get("params") or {})
 

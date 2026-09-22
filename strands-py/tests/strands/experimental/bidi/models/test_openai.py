@@ -16,26 +16,24 @@ import unittest.mock
 
 import pytest
 
-from strands.experimental.bidi.models.model import BidiModelTimeoutError
+from strands.experimental.bidi.models import BidiModelTimeoutError, OpenAIRealtimeModel
 from strands.experimental.bidi.models.openai import (
     _RESTART_INSTRUCTION,
     OPENAI_MAX_TIMEOUT_S,
     OPENAI_PROACTIVE_RECONNECT_MARGIN_S,
-    OpenAIRealtimeModel,
 )
-from strands.experimental.bidi.types.events import (
-    BidiAudioInputEvent,
+from strands.experimental.bidi.types import (
+    AudioDelta,
     BidiAudioStreamEvent,
     BidiConnectionStartEvent,
-    BidiImageInputEvent,
     BidiInterruptionEvent,
     BidiResponseCompleteEvent,
-    BidiTextInputEvent,
     BidiTranscriptCompleteEvent,
     BidiTranscriptStreamEvent,
 )
-from strands.types._events import ToolResultEvent
-from strands.types.tools import ToolResult
+from strands.types.content import TextBlock
+from strands.types.media import ImageBlock
+from strands.types.tools import ToolResultBlock
 
 
 @pytest.fixture
@@ -140,64 +138,68 @@ def test_model_initialization(api_key, model_name, monkeypatch):
 # Audio Configuration Tests
 
 
-def test_audio_config_defaults(api_key, model_name):
-    """Test default audio configuration."""
-    model = OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+@pytest.mark.parametrize(
+    ("options", "voice"),
+    [
+        pytest.param({}, "alloy", id="defaults"),
+        pytest.param({"voice": "echo"}, "echo", id="custom-voice"),
+    ],
+)
+def test_get_audio_config(api_key, options, voice):
+    model = OpenAIRealtimeModel(api_key=api_key, **options)
 
-    assert model.get_audio_config() == {
-        "input_rate": 24000,
-        "output_rate": 24000,
-        "channels": 1,
-        "format": "pcm",
-        "voice": "alloy",
+    tru_config = model.get_audio_config()
+    exp_config = {
+        "input": {"sample_rate": 24000, "channels": 1, "format": "pcm"},
+        "output": {"sample_rate": 24000, "channels": 1, "format": "pcm"},
     }
+    assert tru_config == exp_config
+    assert model.get_audio_config() is tru_config
+
+    tru_output = model._build_session_config(None, None)["audio"]["output"]
+    exp_output = {"format": {"type": "audio/pcm", "rate": 24000}, "voice": voice}
+    assert tru_output == exp_output
 
 
-def test_audio_config_partial_override(api_key, model_name):
-    """Test partial audio configuration override."""
-    model = OpenAIRealtimeModel(
-        model_id=model_name,
-        api_key=api_key,
-        audio={"output_rate": 48000, "voice": "echo"},
-    )
+@pytest.mark.parametrize("direction", ["input", "output"])
+@pytest.mark.parametrize(
+    "audio_format",
+    [
+        {"rate": 48000},
+        {"rate": None},
+        {"type": "audio/pcmu"},
+        {"type": "audio/pcma"},
+        {"type": "audio/mp3"},
+    ],
+)
+def test__init__rejects_unsupported_audio_format(api_key, direction, audio_format):
+    with pytest.raises(ValueError, match="Unsupported"):
+        OpenAIRealtimeModel(api_key=api_key, params={"audio": {direction: {"format": audio_format}}})
 
-    assert model.get_audio_config() == {
-        "input_rate": 24000,
-        "output_rate": 48000,
-        "channels": 1,
-        "format": "pcm",
-        "voice": "echo",
+
+@pytest.mark.parametrize("direction", ["input", "output"])
+@pytest.mark.parametrize(
+    "audio_format",
+    [
+        {"type": "audio/pcmu"},
+        {"rate": 16000},
+    ],
+)
+def test_update_config_rejects_unsupported_audio_format(api_key, direction, audio_format):
+    model = OpenAIRealtimeModel(api_key=api_key, params={"max_output_tokens": 2048})
+    audio_config = model.get_audio_config()
+
+    with pytest.raises(ValueError, match="Unsupported"):
+        model.update_config(model_id="updated-model", params={"audio": {direction: {"format": audio_format}}})
+
+    tru_config = model.get_config()
+    exp_config = {
+        "model_id": "gpt-realtime",
+        "params": {"max_output_tokens": 2048},
+        "connection": {"restart_after_s": OPENAI_MAX_TIMEOUT_S - OPENAI_PROACTIVE_RECONNECT_MARGIN_S},
     }
-
-
-def test_audio_config_full_override(api_key, model_name):
-    """Test full audio configuration override."""
-    model = OpenAIRealtimeModel(
-        model_id=model_name,
-        api_key=api_key,
-        audio={
-            "input_rate": 48000,
-            "output_rate": 48000,
-            "channels": 2,
-            "format": "pcm",
-            "voice": "shimmer",
-        },
-    )
-
-    assert model.get_audio_config() == {
-        "input_rate": 48000,
-        "output_rate": 48000,
-        "channels": 2,
-        "format": "pcm",
-        "voice": "shimmer",
-    }
-
-
-def test_audio_config_voice_override(api_key, model_name):
-    """Test that voice can be configured independently."""
-    model = OpenAIRealtimeModel(model_id=model_name, api_key=api_key, audio={"voice": "fable"})
-
-    assert model.get_audio_config()["voice"] == "fable"
+    assert tru_config == exp_config
+    assert model.get_audio_config() is audio_config
 
 
 def test_init_without_api_key_raises(monkeypatch):
@@ -375,8 +377,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     await model.start()
 
     # Test text input
-    text_input = BidiTextInputEvent(text="Hello", role="user")
-    await model.send(text_input)
+    await model.send(TextBlock("Hello"))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -384,15 +385,9 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     assert len(item_create) > 0
     assert len(response_create) > 0
 
-    # Test audio input (base64 encoded)
+    # Test audio input
     audio_b64 = base64.b64encode(b"audio_bytes").decode("utf-8")
-    audio_input = BidiAudioInputEvent(
-        audio=audio_b64,
-        format="pcm",
-        sample_rate=24000,
-        channels=1,
-    )
-    await model.send(audio_input)
+    await model.send(AudioDelta(format="pcm", source={"bytes": b"audio_bytes"}))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     audio_append = [m for m in messages if m.get("type") == "input_audio_buffer.append"]
@@ -402,12 +397,8 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     assert audio_append[0]["audio"] == audio_b64
 
     # Test tool result with text content
-    tool_result: ToolResult = {
-        "toolUseId": "tool-123",
-        "status": "success",
-        "content": [{"text": "Result: 42"}],
-    }
-    await model.send(ToolResultEvent(tool_result))
+    tool_result = ToolResultBlock(tool_use_id="tool-123", status="success", content=[{"text": "Result: 42"}])
+    await model.send(tool_result)
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -420,12 +411,10 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     assert output == [{"text": "Result: 42"}]
 
     # Test tool result with JSON content
-    tool_result_json: ToolResult = {
-        "toolUseId": "tool-456",
-        "status": "success",
-        "content": [{"json": {"result": 42, "status": "ok"}}],
-    }
-    await model.send(ToolResultEvent(tool_result_json))
+    tool_result_json = ToolResultBlock(
+        tool_use_id="tool-456", status="success", content=[{"json": {"result": 42, "status": "ok"}}]
+    )
+    await model.send(tool_result_json)
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -437,12 +426,12 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     assert output == [{"json": {"result": 42, "status": "ok"}}]
 
     # Test tool result with multiple content blocks
-    tool_result_multi: ToolResult = {
-        "toolUseId": "tool-789",
-        "status": "success",
-        "content": [{"text": "Part 1"}, {"json": {"data": "value"}}, {"text": "Part 2"}],
-    }
-    await model.send(ToolResultEvent(tool_result_multi))
+    tool_result_multi = ToolResultBlock(
+        tool_use_id="tool-789",
+        status="success",
+        content=[{"text": "Part 1"}, {"json": {"data": "value"}}, {"text": "Part 2"}],
+    )
+    await model.send(tool_result_multi)
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -454,22 +443,22 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     assert output == [{"text": "Part 1"}, {"json": {"data": "value"}}, {"text": "Part 2"}]
 
     # Test tool result with image content (should raise error)
-    tool_result_image: ToolResult = {
-        "toolUseId": "tool-999",
-        "status": "success",
-        "content": [{"image": {"format": "jpeg", "source": {"bytes": b"image_data"}}}],
-    }
+    tool_result_image = ToolResultBlock(
+        tool_use_id="tool-999",
+        status="success",
+        content=[{"image": {"format": "jpeg", "source": {"bytes": b"image_data"}}}],
+    )
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(ToolResultEvent(tool_result_image))
+        await model.send(tool_result_image)
 
     # Test tool result with document content (should raise error)
-    tool_result_doc: ToolResult = {
-        "toolUseId": "tool-888",
-        "status": "success",
-        "content": [{"document": {"format": "pdf", "source": {"bytes": b"doc_data"}}}],
-    }
+    tool_result_doc = ToolResultBlock(
+        tool_use_id="tool-888",
+        status="success",
+        content=[{"document": {"format": "pdf", "source": {"bytes": b"doc_data"}}}],
+    )
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(ToolResultEvent(tool_result_doc))
+        await model.send(tool_result_doc)
 
     await model.stop()
 
@@ -480,20 +469,15 @@ async def test_send_edge_cases(mock_websockets_connect, model):
     _, mock_ws = mock_websockets_connect
 
     # Test send when inactive
-    text_input = BidiTextInputEvent(text="Hello", role="user")
     with pytest.raises(RuntimeError, match=r"call start before sending"):
-        await model.send(text_input)
+        await model.send(TextBlock("Hello"))
     mock_ws.send.assert_not_called()
 
     # Test image input (sent as input_image content block on user message)
     await model.start()
     mock_ws.send.reset_mock()
     image_b64 = base64.b64encode(b"image_bytes").decode("utf-8")
-    image_input = BidiImageInputEvent(
-        image=image_b64,
-        mime_type="image/jpeg",
-    )
-    await model.send(image_input)
+    await model.send(ImageBlock(format="jpeg", source={"bytes": b"image_bytes"}))
 
     # Verify exactly one event was sent: a conversation.item.create with input_image
     image_calls = [json.loads(call[0][0]) for call in mock_ws.send.call_args_list]
@@ -709,7 +693,7 @@ def test_convert_openai_event_transcript(model, event, expected):
 def test__build_session_config_direct_options(api_key, system_prompt, tool_spec):
     model = OpenAIRealtimeModel(
         api_key=api_key,
-        audio={"input_rate": 16000, "output_rate": 48000, "voice": "coral"},
+        voice="coral",
     )
 
     config = model._build_session_config(system_prompt, [tool_spec])
@@ -722,8 +706,8 @@ def test__build_session_config_direct_options(api_key, system_prompt, tool_spec)
             "parameters": tool_spec["inputSchema"]["json"],
         }
     ]
-    assert config["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
-    assert config["audio"]["output"] == {"format": {"type": "audio/pcm", "rate": 48000}, "voice": "coral"}
+    assert config["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert config["audio"]["output"] == {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "coral"}
 
 
 def test__build_session_config_passes_through_params(api_key):
@@ -744,7 +728,7 @@ def test__build_session_config_merges_params_last(api_key, system_prompt, tool_s
     """Params override direct options while preserving unspecified nested defaults."""
     model = OpenAIRealtimeModel(
         api_key=api_key,
-        audio={"input_rate": 48000, "output_rate": 48000, "voice": "echo"},
+        voice="echo",
         params={
             "instructions": "",
             "tools": [],
@@ -787,7 +771,7 @@ def test__build_session_config_preserves_defaults(model, api_key, system_prompt,
     exp_config = model._build_session_config(None, None)
     custom_model = OpenAIRealtimeModel(
         api_key=api_key,
-        audio={"voice": "coral", "input_rate": 48000},
+        voice="coral",
         params={"output_modalities": ["text"]},
     )
 
@@ -842,7 +826,7 @@ async def test_start_preserves_explicit_nulls(api_key, mock_websockets_connect):
 def test_update_config_replaces_params(api_key, params, exp_voice):
     model = OpenAIRealtimeModel(
         api_key=api_key,
-        audio={"voice": "coral"},
+        voice="coral",
         params={"instructions": "Params instructions", "audio": {"output": {"voice": "echo"}}},
     )
 
@@ -915,87 +899,14 @@ async def test_send_event_helper(mock_websockets_connect, model):
     await model.stop()
 
 
-@pytest.mark.asyncio
-async def test_custom_audio_sample_rate(mock_websockets_connect, api_key):
-    """Test that a custom audio sample rate is used in audio events."""
-    _, mock_ws = mock_websockets_connect
+@pytest.mark.parametrize("voice", ["alloy", "echo"])
+def test__convert_openai_event_audio_format(api_key, voice):
+    model = OpenAIRealtimeModel(api_key=api_key, voice=voice)
+    audio_base64 = base64.b64encode(b"audio data").decode()
 
-    custom_sample_rate = 48000
-    model = OpenAIRealtimeModel(api_key=api_key, audio={"output_rate": custom_sample_rate})
-
-    await model.start()
-
-    # Simulate receiving an audio delta event from OpenAI
-    openai_audio_event = {"type": "response.output_audio.delta", "delta": "base64audiodata"}
-
-    # Convert the event
-    converted_events = model._convert_openai_event(openai_audio_event)
-
-    # Verify the audio event uses the custom sample rate
-    assert converted_events is not None
-    assert len(converted_events) == 1
-    audio_event = converted_events[0]
-    assert isinstance(audio_event, BidiAudioStreamEvent)
-    assert audio_event.sample_rate == custom_sample_rate
-    assert audio_event.format == "pcm"
-    assert audio_event.channels == 1
-
-    await model.stop()
-
-
-@pytest.mark.asyncio
-async def test_default_audio_sample_rate(mock_websockets_connect, api_key):
-    """Test that default audio sample rate is used when no custom config is provided."""
-    _, mock_ws = mock_websockets_connect
-
-    # Create model without custom audio config
-    model = OpenAIRealtimeModel(api_key=api_key)
-
-    await model.start()
-
-    # Simulate receiving an audio delta event from OpenAI
-    openai_audio_event = {"type": "response.output_audio.delta", "delta": "base64audiodata"}
-
-    # Convert the event
-    converted_events = model._convert_openai_event(openai_audio_event)
-
-    # Verify the audio event uses the default sample rate (24000)
-    assert converted_events is not None
-    assert len(converted_events) == 1
-    audio_event = converted_events[0]
-    assert isinstance(audio_event, BidiAudioStreamEvent)
-    assert audio_event.sample_rate == 24000  # Default from DEFAULT_SAMPLE_RATE
-    assert audio_event.format == "pcm"
-    assert audio_event.channels == 1
-
-    await model.stop()
-
-
-@pytest.mark.asyncio
-async def test_partial_audio_config(mock_websockets_connect, api_key):
-    """Test that partial audio config doesn't break and falls back to defaults."""
-    _, mock_ws = mock_websockets_connect
-
-    model = OpenAIRealtimeModel(api_key=api_key, audio={"voice": "alloy"})
-
-    await model.start()
-
-    # Simulate receiving an audio delta event from OpenAI
-    openai_audio_event = {"type": "response.output_audio.delta", "delta": "base64audiodata"}
-
-    # Convert the event
-    converted_events = model._convert_openai_event(openai_audio_event)
-
-    # Verify the audio event uses the default sample rate
-    assert converted_events is not None
-    assert len(converted_events) == 1
-    audio_event = converted_events[0]
-    assert isinstance(audio_event, BidiAudioStreamEvent)
-    assert audio_event.sample_rate == 24000  # Falls back to default
-    assert audio_event.format == "pcm"
-    assert audio_event.channels == 1
-
-    await model.stop()
+    tru_events = model._convert_openai_event({"type": "response.output_audio.delta", "delta": audio_base64})
+    exp_events = [BidiAudioStreamEvent(audio=audio_base64, format="pcm", sample_rate=24000, channels=1)]
+    assert tru_events == exp_events
 
 
 # Tool Result Content Tests
@@ -1008,13 +919,9 @@ async def test_tool_result_single_text_content(mock_websockets_connect, api_key)
     model = OpenAIRealtimeModel(api_key=api_key)
     await model.start()
 
-    tool_result: ToolResult = {
-        "toolUseId": "call-123",
-        "status": "success",
-        "content": [{"text": "Simple text result"}],
-    }
+    tool_result = ToolResultBlock(tool_use_id="call-123", status="success", content=[{"text": "Simple text result"}])
 
-    await model.send(ToolResultEvent(tool_result))
+    await model.send(tool_result)
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1039,13 +946,11 @@ async def test_tool_result_single_json_content(mock_websockets_connect, api_key)
     model = OpenAIRealtimeModel(api_key=api_key)
     await model.start()
 
-    tool_result: ToolResult = {
-        "toolUseId": "call-456",
-        "status": "success",
-        "content": [{"json": {"temperature": 72, "condition": "sunny"}}],
-    }
+    tool_result = ToolResultBlock(
+        tool_use_id="call-456", status="success", content=[{"json": {"temperature": 72, "condition": "sunny"}}]
+    )
 
-    await model.send(ToolResultEvent(tool_result))
+    await model.send(tool_result)
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1069,17 +974,17 @@ async def test_tool_result_multiple_content_blocks(mock_websockets_connect, api_
     model = OpenAIRealtimeModel(api_key=api_key)
     await model.start()
 
-    tool_result: ToolResult = {
-        "toolUseId": "call-789",
-        "status": "success",
-        "content": [
+    tool_result = ToolResultBlock(
+        tool_use_id="call-789",
+        status="success",
+        content=[
             {"text": "Weather data:"},
             {"json": {"temp": 72, "humidity": 65}},
             {"text": "Forecast: sunny"},
         ],
-    }
+    )
 
-    await model.send(ToolResultEvent(tool_result))
+    await model.send(tool_result)
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1107,14 +1012,14 @@ async def test_tool_result_image_content_raises_error(mock_websockets_connect, a
     model = OpenAIRealtimeModel(api_key=api_key)
     await model.start()
 
-    tool_result: ToolResult = {
-        "toolUseId": "call-999",
-        "status": "success",
-        "content": [{"image": {"format": "jpeg", "source": {"bytes": b"fake_image_data"}}}],
-    }
+    tool_result = ToolResultBlock(
+        tool_use_id="call-999",
+        status="success",
+        content=[{"image": {"format": "jpeg", "source": {"bytes": b"fake_image_data"}}}],
+    )
 
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(ToolResultEvent(tool_result))
+        await model.send(tool_result)
 
     await model.stop()
 
@@ -1126,14 +1031,14 @@ async def test_tool_result_document_content_raises_error(mock_websockets_connect
     model = OpenAIRealtimeModel(api_key=api_key)
     await model.start()
 
-    tool_result: ToolResult = {
-        "toolUseId": "call-888",
-        "status": "success",
-        "content": [{"document": {"format": "pdf", "source": {"bytes": b"fake_pdf_data"}}}],
-    }
+    tool_result = ToolResultBlock(
+        tool_use_id="call-888",
+        status="success",
+        content=[{"document": {"format": "pdf", "source": {"bytes": b"fake_pdf_data"}}}],
+    )
 
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(ToolResultEvent(tool_result))
+        await model.send(tool_result)
 
     await model.stop()
 
@@ -1337,6 +1242,11 @@ async def test_receive_binds_websocket_per_reader(mock_websockets_connect, model
         return_value=json.dumps({"type": "response.output_audio.delta", "delta": "FROM_WS2"})
     )
     model._websocket = ws2
+    blocker.set()
+    tru_event = await reader.__anext__()
+    exp_event = BidiAudioStreamEvent(audio="FROM_WS1", format="pcm", sample_rate=24000, channels=1)
+    assert tru_event == exp_event
+    blocker.clear()
 
     # The bound reader stays parked on ws1 and never touches the replacement socket.
     with pytest.raises(asyncio.TimeoutError):
